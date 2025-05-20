@@ -25,12 +25,14 @@
 #include <string.h>
 #include "mutex.h"
 #include "rpc.h"
+#include "regs.h"
 #include "lib_ctrl.h"
 #include "lib_util.h"
 #include "dprintf.h"
 #include <atomic>
 
 
+#if 0
 /*
  * Local admin queue-pair descriptor.
  */
@@ -41,7 +43,7 @@ struct local_admin
     nvm_queue_t         asq;        // Admin submission queue (ASQ)
     uint64_t            timeout;    // Controller timeout
 };
-
+#endif
 
 
 /*
@@ -323,6 +325,65 @@ static int execute_command(struct local_admin* admin, const nvm_cmd_t* cmd, nvm_
 
 
 
+
+/*
+ * Execute an NVM admin command for secondary process.
+ * Lock must be held when calling this function.
+ */
+static int execute_command_shared(struct local_admin* admin, const nvm_cmd_t* cmd, nvm_cpl_t* cpl)
+{
+    nvm_cmd_t local_copy;
+    nvm_cmd_t* in_queue_cmd;
+    nvm_cpl_t* in_queue_cpl;
+
+    // Try to enqueue a message
+    if ((in_queue_cmd = nvm_sq_enqueue_shared(&admin->asq, admin->asq_vaddr1)) == NULL)
+    {
+        // Queue was full, but we're holding the lock so no blocking
+        return EAGAIN;
+    }
+
+    // Copy command into queue slot (but keep original id)
+    uint16_t in_queue_id = NVM_DEFAULT_CID(&admin->asq);
+
+    memcpy(&local_copy, cmd, sizeof(nvm_cmd_t));
+
+    *NVM_CMD_CID(&local_copy) = in_queue_id;
+    *in_queue_cmd = local_copy;
+
+    //for (int i = 0; i < 16; i++) {
+    //    printf("cmd: %p\tdword[%d] = %x\n", in_queue_cmd, i, local_copy.dword[i]);
+    //}
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // Submit command and wait for completion
+    nvm_sq_submit_shared(&admin->asq, admin->asq_db1);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    in_queue_cpl = nvm_cq_dequeue_block_shared(&admin->acq, admin->acq_vaddr1, admin->timeout);
+    if (in_queue_cpl == NULL)
+    {
+        dprintf("Waiting for admin queue completion timed out\n");
+        return ETIME;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    //for (int i = 0; i < 4; i++) {
+    //    printf("cpl: %p\tdword[%d] = %x\n", in_queue_cpl, i, in_queue_cpl->dword[i]);
+    //}
+    //printf("cpl cmd_id: %u\tstatus and phase: %x\n", in_queue_cpl->dword[3] & 0x0000ffff, in_queue_cpl->dword[3] >> 16);
+
+    nvm_sq_update_shared(&admin->asq, admin->asq_db1);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // Copy completion and return
+    *cpl = *in_queue_cpl;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    nvm_cq_update_shared(&admin->acq, admin->acq_db1);
+
+    //*NVM_CPL_CID(cpl) = *NVM_CMD_CID(cmd);
+
+    return 0;
+}
+
+
+
 /*
  * Helper function to create a local admin descriptor.
  */
@@ -380,6 +441,107 @@ static int create_admin(struct local_admin** handle, const struct controller* ct
 }
 
 
+
+/*
+ * Helper function to initialize an admin descriptor, which can be shared with
+ * secondary processes.
+ */
+static int create_admin_new(struct local_admin** handle, const struct controller* ctrl,
+			    const nvm_dma_t* window, struct local_admin *admin)
+{
+    int status;
+    nvm_dma_t* copy;
+
+    *handle = NULL;
+
+    if (ctrl->handle.page_size != window->page_size)
+    {
+        dprintf("Controller page size differs from DMA window page size\n");
+        return EINVAL;
+    }
+    else if (window->n_ioaddrs < 2)
+    {
+        dprintf("DMA window is not large enough\n");
+        return ERANGE;
+    }
+    else if (window->vaddr == NULL)
+    {
+        dprintf("DMA window is not mapped into virtual address space\n");
+        return EINVAL;
+    }
+
+    status = nvm_dma_remap(&copy, window);
+    if (status != 0)
+    {
+        dprintf("Couldn't remap\n");
+        return status;
+    }
+
+    admin->qmem = copy;
+    admin->shared_qmem = NULL;
+    memset((void*) admin->qmem->vaddr, 0, 2 * admin->qmem->page_size);
+
+    nvm_queue_clear(&admin->acq, &ctrl->handle, true, 0, ctrl->handle.page_size / sizeof(nvm_cpl_t),
+            admin->qmem->local, admin->qmem->vaddr, admin->qmem->ioaddrs[0]);
+
+    nvm_queue_clear(&admin->asq, &ctrl->handle, false, 0, ctrl->handle.page_size / sizeof(nvm_cmd_t),
+            admin->qmem->local,  NVM_DMA_OFFSET(admin->qmem, 1), admin->qmem->ioaddrs[1]);
+
+    admin->timeout = ctrl->handle.timeout;
+
+    *handle = admin;
+    return 0;
+}
+
+
+
+/*
+ * Helper function for secondary process to share admin descriptor with
+ * primary process.
+ */
+static int share_admin(struct local_admin** handle, const struct controller* ctrl,
+		       const nvm_dma_t* window, struct local_admin *admin)
+{
+    int status;
+    nvm_dma_t* copy;
+
+    *handle = NULL;
+
+    if (ctrl->handle.page_size != window->page_size)
+    {
+        dprintf("Controller page size differs from DMA window page size\n");
+        return EINVAL;
+    }
+    else if (window->n_ioaddrs < 2)
+    {
+        dprintf("DMA window is not large enough\n");
+        return ERANGE;
+    }
+    else if (window->vaddr == NULL)
+    {
+        dprintf("DMA window is not mapped into virtual address space\n");
+        return EINVAL;
+    }
+
+    if (admin->shared_qmem != NULL)
+    {
+        dprintf("Another process is already sharing the admin queue\n");
+        return EINVAL;
+    }
+
+    status = nvm_dma_remap(&copy, window);
+    if (status != 0)
+    {
+        return status;
+    }
+
+    admin->shared_qmem = copy;
+
+    *handle = admin;
+    return 0;
+}
+
+
 /*
  * Helper function to remove an admin descriptor.
  */
@@ -389,6 +551,31 @@ static void remove_admin(struct local_admin* admin)
     {
         nvm_dma_unmap(admin->qmem);
         free(admin);
+    }
+}
+
+
+/*
+ * Helper function to remove shared memory reference of primary process.
+ */
+static void remove_admin_new(struct local_admin* admin)
+{
+    if (admin != NULL)
+    {
+        nvm_dma_unmap(admin->qmem);
+    }
+}
+
+
+/*
+ * Helper function to remove shared memory reference of secondary process.
+ */
+static void remove_admin_shared(struct local_admin* admin)
+{
+    if (admin != NULL)
+    {
+        nvm_dma_unmap(admin->shared_qmem);
+        admin->shared_qmem = NULL;
     }
 }
 
@@ -486,9 +673,89 @@ int nvm_aq_create(nvm_aq_ref* handle, const nvm_ctrl_t* ctrl, const nvm_dma_t* w
     // Reset controller
     const struct local_admin* admin = (const struct local_admin*) ref->data;
     nvm_raw_ctrl_reset(ctrl, admin->qmem->ioaddrs[0], admin->qmem->ioaddrs[1]);
-    //printf("admin sq vaddr: %p\tsq ioaddr: %lx\n", admin->qmem->vaddr, admin->qmem->ioaddrs[0]);
-    //printf("admin cq vaddr: %p\tcq ioaddr: %lx\n", admin->qmem->vaddr+4096, admin->qmem->ioaddrs[1]);
+    //printf("admin sq vaddr: %p\tsq ioaddr: %lx\n", NVM_DMA_OFFSET(admin->qmem, 1), admin->qmem->ioaddrs[1]);
+    //printf("admin cq vaddr: %p\tcq ioaddr: %lx\n", admin->qmem->vaddr, admin->qmem->ioaddrs[0]);
     
+    *handle = ref;
+    return 0;
+}
+
+
+/*
+ * Initialize admin queues and reset controller.
+ */
+int nvm_aq_create_new(nvm_aq_ref* handle, const nvm_ctrl_t* ctrl, const nvm_dma_t* window,
+		      struct local_admin *admin)
+{
+    int err;
+    nvm_aq_ref ref;
+
+    *handle = NULL;
+
+    // Allocate reference
+    err = _nvm_ref_get(&ref, ctrl);
+    if (err != 0)
+    {
+        return err;
+    }
+
+    // Initialize admin descriptor
+    err = create_admin_new((struct local_admin**) &ref->data, ref->ctrl, window, admin);
+    if (err != 0)
+    {
+        _nvm_ref_put(ref);
+        return err;
+    }
+
+    ref->stub = (rpc_stub_t) execute_command;
+    ref->release = (rpc_free_binding_t) &remove_admin_new;
+
+    // Reset controller
+    nvm_raw_ctrl_reset(ctrl, admin->qmem->ioaddrs[0], admin->qmem->ioaddrs[1]);
+    printf("admin sq vaddr: %p\tsq ioaddr: %lx\n", NVM_DMA_OFFSET(admin->qmem, 1), admin->qmem->ioaddrs[1]);
+    printf("admin cq vaddr: %p\tcq ioaddr: %lx\n", admin->qmem->vaddr, admin->qmem->ioaddrs[0]);
+
+    *handle = ref;
+    return 0;
+}
+
+
+/*
+ * Share admin queues resources.
+ */
+int nvm_aq_share(nvm_aq_ref* handle, const nvm_ctrl_t* ctrl, const nvm_dma_t* window, struct local_admin *admin)
+{
+    int err;
+    nvm_aq_ref ref;
+
+    *handle = NULL;
+
+    // Allocate reference
+    err = _nvm_ref_get(&ref, ctrl);
+    if (err != 0)
+    {
+        return err;
+    }
+
+    // Share admin descriptor
+    err = share_admin((struct local_admin**) &ref->data, ref->ctrl, window, admin);
+    if (err != 0)
+    {
+        _nvm_ref_put(ref);
+        return err;
+    }
+
+    ref->stub = (rpc_stub_t) execute_command_shared;
+    ref->release = (rpc_free_binding_t) &remove_admin_shared;
+
+    printf("admin sq vaddr: %p\tsq ioaddr: %lx\n", NVM_DMA_OFFSET(admin->shared_qmem, 1), admin->shared_qmem->ioaddrs[1]);
+    printf("admin cq vaddr: %p\tcq ioaddr: %lx\n", admin->shared_qmem->vaddr, admin->shared_qmem->ioaddrs[0]);
+
+    admin->asq_vaddr1 = NVM_DMA_OFFSET(admin->shared_qmem, 1);
+    admin->acq_vaddr1 = admin->shared_qmem->vaddr;
+    admin->asq_db1 = SQ_DBL(ctrl->mm_ptr, admin->asq.no, ctrl->dstrd);
+    admin->acq_db1 = CQ_DBL(ctrl->mm_ptr, admin->acq.no, ctrl->dstrd);
+
     *handle = ref;
     return 0;
 }

@@ -6,10 +6,28 @@
 // #endif
 
 #include <nvm_types.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
+
+/*
+ * Shared admin queue-pair descriptor.
+ */
+struct local_admin
+{
+    pthread_mutex_t     mutex;      // Mutex for this shared memory segment
+    nvm_dma_t*          qmem;       // Primary process queue memory
+    nvm_dma_t*          shared_qmem;// Secondary process queue memory
+    nvm_queue_t         acq;        // Admin completion queue (ACQ)
+    volatile uint32_t*  acq_db1;    // Pointer to secondary acq doorbell register (NB! write only)
+    volatile void*      acq_vaddr1; // Virtual address to start of acq for secondary process
+    nvm_queue_t         asq;        // Admin submission queue (ASQ)
+    volatile uint32_t*  asq_db1;    // Pointer to secondary asq doorbell register (NB! write only)
+    volatile void*      asq_vaddr1; // Virtual address to start of asq for secondary process
+    uint64_t            timeout;    // Controller timeout
+};
 
 
 /*
@@ -23,6 +41,29 @@
 int nvm_aq_create(nvm_aq_ref* ref, 
                   const nvm_ctrl_t* ctrl, 
                   const nvm_dma_t* dma_window);
+
+
+/*
+ * Configure admin queue pair
+ *
+ * This function resets the controller and configures NVM admin queues.
+ * This doesn't take exclusive ownership of an NVM controller.
+ * The shared memory segment for admin qpair must be passed.
+ *
+ * Returns a reference handle that can be used for admin RPC calls.
+ */
+int nvm_aq_create_new(nvm_aq_ref* handle,
+		      const nvm_ctrl_t* ctrl, const nvm_dma_t* window,
+		      struct local_admin *admin);
+
+
+/*
+ * Share already configured admin queue pair
+ *
+ * Returns a reference handle that can be used for admin RPC calls.
+ */
+int nvm_aq_share(nvm_aq_ref* handle, const nvm_ctrl_t* ctrl,
+		 const nvm_dma_t* window, struct local_admin *admin);
 
 
 /*

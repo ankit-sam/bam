@@ -83,6 +83,33 @@ nvm_cmd_t* nvm_sq_enqueue(nvm_queue_t* sq)
 }
 
 
+/*
+ * Enqueue a submission command for secondary process.
+ * Functionality wise similar to nvm_sq_enqueue()
+ */
+__host__ __device__ static inline
+nvm_cmd_t* nvm_sq_enqueue_shared(nvm_queue_t* sq, volatile void* vaddr)
+{
+    // Check if queue is full
+    if (((uint16_t) (sq->tail - sq->head) % sq->qs) == sq->qs - 1)
+    {
+        return NULL;
+    }
+
+    // Take slot and end of queue
+    nvm_cmd_t* cmd = (nvm_cmd_t*) (((unsigned char*) vaddr) + sq->es * sq->tail);
+
+    // Increase tail pointer and invert phase tag if necessary
+    if (++sq->tail == sq->qs)
+    {
+        sq->phase = !sq->phase;
+        sq->tail = 0;
+    }
+
+    return cmd;
+}
+
+
 
 /*
  * Enqueue command the i'th of n threads.
@@ -174,6 +201,24 @@ nvm_cpl_t* nvm_cq_poll(const nvm_queue_t* cq)
 }
 
 
+/*
+ * Poll completion queue for secondary process.
+ * Functionality wise similar to nvm_cq_poll().
+ */
+__host__ __device__ static inline
+nvm_cpl_t* nvm_cq_poll_shared(const nvm_queue_t* cq, volatile void* vaddr)
+{
+    nvm_cpl_t* cpl = (nvm_cpl_t*) (((unsigned char*) vaddr) + cq->es * cq->head);
+
+    // Check if new completion is ready by checking the phase tag
+    if (!_RB(*NVM_CPL_STATUS(cpl), 0, 0) != !cq->phase)
+    {
+        return NULL;
+    }
+
+    return cpl;
+}
+
 
 /* 
  * Dequeue completion queue entry.
@@ -189,6 +234,29 @@ __host__ __device__ static inline
 nvm_cpl_t* nvm_cq_dequeue(nvm_queue_t* cq)
 {
     nvm_cpl_t* cpl = nvm_cq_poll(cq);
+
+    if (cpl != NULL)
+    {
+        // Increase head pointer and invert phase tag
+        if (++cq->head == cq->qs)
+        {
+            cq->head = 0;
+            cq->phase = !cq->phase;
+        }
+    }
+
+    return cpl;
+}
+
+
+/*
+ * Dequeue completion queue entry for secondary process.
+ * Functionality wise similar to nvm_cq_dequeue().
+ */
+__host__ __device__ static inline
+nvm_cpl_t* nvm_cq_dequeue_shared(nvm_queue_t* cq, volatile void* vaddr)
+{
+    nvm_cpl_t* cpl = nvm_cq_poll_shared(cq, vaddr);
 
     if (cpl != NULL)
     {
@@ -221,6 +289,14 @@ nvm_cpl_t* nvm_cq_dequeue_block(nvm_queue_t* cq, uint64_t timeout);
 
 
 
+/*
+ * Dequeue completion queue entry for secondary process.
+ * Functionality wise similar to nvm_cq_dequeue_block().
+ */
+__host__
+nvm_cpl_t* nvm_cq_dequeue_block_shared(nvm_queue_t* cq, volatile void* vaddr, uint64_t timeout);
+
+
 
 /* 
  * Update SQ tail pointer.
@@ -251,6 +327,20 @@ void nvm_sq_submit(nvm_queue_t* sq)
     }
 }
 
+/*
+ * Update SQ tail pointer for secondary process.
+ * Functionality wise similar to nvm_sq_submit().
+ */
+__host__ __device__ static inline
+void nvm_sq_submit_shared(nvm_queue_t* sq, volatile uint32_t* db)
+{
+    if (sq->last != sq->tail && db != NULL)
+    {
+        *((volatile uint32_t*) db) = sq->tail;
+        sq->last = sq->tail;
+    }
+}
+
 
 
 /* 
@@ -261,6 +351,21 @@ void nvm_sq_update(nvm_queue_t* sq)
 {
     // Update head pointer of submission queue
     if (sq->db != NULL && ++sq->head == sq->qs)
+    {
+        sq->head = 0;
+    }
+}
+
+
+/*
+ * Update SQ head pointer for secondary process.
+ * Functionality wise similar to nvm_sq_update().
+ */
+__host__ __device__ static inline
+void nvm_sq_update_shared(nvm_queue_t* sq, volatile uint32_t* db)
+{
+    // Update head pointer of submission queue
+    if (db != NULL && ++sq->head == sq->qs)
     {
         sq->head = 0;
     }
@@ -281,6 +386,21 @@ void nvm_cq_update(nvm_queue_t* cq)
     if (cq->last != cq->head && cq->db != NULL)
     {
         *((volatile uint32_t*) cq->db) = cq->head;
+        cq->tail = cq->last = cq->head;
+    }
+}
+
+
+/*
+ * Update controller's CQ head pointer for secondary process.
+ * Functionality wise similar to nvm_cq_update().
+ */
+__host__ __device__ static inline
+void nvm_cq_update_shared(nvm_queue_t* cq, volatile uint32_t* db)
+{
+    if (cq->last != cq->head && db != NULL)
+    {
+        *((volatile uint32_t*) db) = cq->head;
         cq->tail = cq->last = cq->head;
     }
 }

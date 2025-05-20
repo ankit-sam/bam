@@ -65,3 +65,18 @@ nvm_cpl_t* nvm_cq_dequeue_block(nvm_queue_t* cq, uint64_t timeout)
     return cpl;
 }
 
+
+nvm_cpl_t* nvm_cq_dequeue_block_shared(nvm_queue_t* cq, volatile void* vaddr, uint64_t timeout)
+{
+    uint64_t nsecs = timeout * 1000000UL;
+    nvm_cpl_t* cpl = nvm_cq_dequeue_shared(cq, vaddr);
+
+    while (cpl == NULL && nsecs > 0)
+    {
+        nsecs = _nvm_delay_remain(nsecs);
+        cpl = nvm_cq_dequeue_shared(cq, vaddr);
+    }
+
+    return cpl;
+}
+
