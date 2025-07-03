@@ -238,6 +238,81 @@ size_t nvm_cmd_data(nvm_cmd_t* cmd, size_t n_lists, const nvm_prp_list_t* lists,
 
 
 
+/*
+ * Build a PRP list consisting of PRP entries.
+ *
+ * Populate a memory page with PRP entries required for a transfer.
+ * Returns the number of PRP entries used. Number of pages should
+ * always be max_data_size (MDTS) for IO commands.
+ *
+ * Note: currently, PRP lists can only be a single page
+ */
+__host__ __device__ static inline
+size_t nvm_prp_list1(size_t page_size, size_t n_pages, void* list_ptr, const uint64_t* data_ioaddrs)
+{
+    // TODO #ifdef __NO_COHERENCE__, make a nvm_prp_list_far variant that does not call nvm_cache_flush()
+    size_t prps_per_page = page_size / sizeof(uint64_t);
+    size_t i_prp;
+    uint64_t* list;
+
+    if (prps_per_page < n_pages)
+    {
+        n_pages = prps_per_page;
+    }
+
+    list = (uint64_t*) list_ptr;
+    for (i_prp = 0; i_prp < n_pages; ++i_prp)
+    {
+        list[i_prp] = data_ioaddrs[i_prp];
+    }
+
+    nvm_cache_flush(list_ptr, sizeof(uint64_t) * i_prp);
+
+    return i_prp;
+}
+
+
+
+/*
+ * Helper function to build a PRP list and set a command's data pointer fields.
+ */
+__host__ __device__ static inline
+size_t nvm_cmd_data1(nvm_cmd_t* cmd,
+                    size_t page_size,
+                    size_t n_pages,
+                    void* list_ptr,
+                    uint64_t list_ioaddr,
+                    const uint64_t* data_ioaddrs)
+{
+    size_t prp = 0;
+    uint64_t dptr0 = 0;
+    uint64_t dptr1 = 0;
+
+#if !defined( NDEBUG ) && !defined( __CUDA_ARCH__ )
+    if (n_pages == 0)
+    {
+        return 0;
+    }
+#endif
+
+    dptr0 = data_ioaddrs[prp++];
+
+    if (n_pages > 2 && list_ptr != NULL)
+    {
+        dptr1 = list_ioaddr;
+        prp += nvm_prp_list1(page_size, n_pages - 1, list_ptr, &data_ioaddrs[prp]);
+    }
+    else if (n_pages >= 2)
+    {
+        dptr1 = data_ioaddrs[prp++];
+    }
+
+    nvm_cmd_data_ptr(cmd, dptr0, dptr1);
+    return prp;
+}
+
+
+
 //#ifndef __CUDACC__
 //#undef __device__
 //#undef __host__
