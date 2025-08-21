@@ -17,7 +17,7 @@
 #include <asm/errno.h>
 #include <asm/page.h>
 
-#define DRIVER_NAME         "libnvm helper"
+#define DRIVER_NAME         "libnvm_helper"
 #define PCI_CLASS_NVME      0x010802
 #define PCI_CLASS_NVME_MASK 0xffffff
 
