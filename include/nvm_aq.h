@@ -27,6 +27,9 @@ struct local_admin
     volatile uint32_t*  asq_db1;    // Pointer to secondary asq doorbell register (NB! write only)
     volatile void*      asq_vaddr1; // Virtual address to start of asq for secondary process
     uint64_t            timeout;    // Controller timeout
+    uint32_t            n_qps;      // Number of IO qpairs
+    uint8_t             qids[128];  // QID available or used
+
 };
 
 
